@@ -829,9 +829,16 @@ pub fn get_protocol_health(env: Env) -> ProtocolHealthStatus {
     let schema_version = _schema_version(&env).unwrap_or(1);
     let mode = _current_mode(&env);
     let is_claims_only = mode == RuntimeMode::ClaimsOnly;
+    let access_restricted = crate::access_control::is_access_control_enabled(env.clone());
 
+    // Every non-`Normal` runtime mode counts as a degradation so that a
+    // ClaimsOnly incident can never mask a stale oracle or stale round
+    // (see "Status precedence" in docs/STATUS_CODES.md).
     let mut issues: u32 = 0;
     if paused {
+        issues += 1;
+    }
+    if is_claims_only {
         issues += 1;
     }
     if !oracle_live {
@@ -853,6 +860,8 @@ pub fn get_protocol_health(env: Env) -> ProtocolHealthStatus {
         3u32 // ROUND_STALE
     } else if !has_active_round {
         4u32 // NO_ACTIVE_ROUND
+    } else if access_restricted {
+        7u32 // ACCESS_RESTRICTED
     } else {
         0u32 // HEALTHY
     };
@@ -880,7 +889,7 @@ pub fn get_oracle_stale_threshold(env: Env) -> u64 {
 }
 
 /// Reads the current [`RuntimeMode`], defaulting to `Normal` if unset.
-fn _current_mode(env: &Env) -> RuntimeMode {
+pub(crate) fn _current_mode(env: &Env) -> RuntimeMode {
     let key = DataKeyCore::Paused;
     _extend_persistent_ttl(env, &key);
     env.storage()
@@ -1202,10 +1211,13 @@ pub fn _require_supported_schema(env: &Env) -> Result<u32, ContractError> {
 ///
 /// # Errors
 /// - `AdminNotSet` — contract not initialized.
-/// - `ContractPaused` — contract is fully paused.
+/// - `ContractPaused` — contract is fully paused (allowed in `ClaimsOnly`).
+/// - `ExpiryNotConfigured` — expiry is disabled (`0`, the default).
+/// - `PendingWinningsNotFound` — the user has no pending winnings (or no
+///   last-credited ledger is recorded for them).
 /// - `PendingWinningsNotExpired` — entry exists but hasn't reached the expiry threshold.
-/// - `NoActiveRound` — used as a generic "no pending winnings" signal when
-///   the entry doesn't exist or expiry is disabled (0).
+///
+/// Operator playbook: `docs/OPS_ARCHIVE_RECLAIM_PLAYBOOK.md`.
 pub fn reclaim_expired_pending_winnings(env: Env, user: Address) -> Result<i128, ContractError> {
     _require_supported_schema(&env)?;
     let admin: Address = env

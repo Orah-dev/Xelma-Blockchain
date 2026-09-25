@@ -20,7 +20,9 @@ mod deviation_reference;
 mod dispute_window;
 mod edge_cases;
 mod drill;
+mod drill_chaos_migration;
 mod event_coverage;
+mod event_order_golden;
 mod fee_model;
 mod guard_tests;
 // mod initialization; // upstream bug
@@ -33,6 +35,7 @@ mod migration_versioning;
 mod min_bet;
 mod mode_tests;
 mod one_sided_settlement;
+mod ops_archive_reclaim;
 mod overflow_tests;
 mod precision_payout_overflow;
 mod pause;

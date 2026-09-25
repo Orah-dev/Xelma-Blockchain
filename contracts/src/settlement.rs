@@ -2530,11 +2530,13 @@ pub fn _archive_round(
                 (symbol_short!("archive"), symbol_short!("pruned")),
                 (oldest, retention_limit),
             );
+            // Drop exactly the id that was just pruned. (A second
+            // `remove(0)` here used to discard the next id without deleting
+            // its `ArchivedRound`, orphaning it and keeping only N-1 rounds.)
             recent.remove(0);
         } else {
             break;
         }
-        recent.remove(0);
     }
 
     env.storage()
