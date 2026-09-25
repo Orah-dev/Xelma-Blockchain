@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: MIT
-//! Exhaustive action × mode matrix for the `AdminConfig` policy class (Issue #402).
+//! Exhaustive action × mode matrix for every `PolicyAction` class
+//! (`AdminConfig` from #402, the remaining three from #551).
 //!
 //! `admin::_policy_gate`'s doc comment inventories every entrypoint dispatched
-//! through each `PolicyAction` class (see `admin.rs`). `policy_gate.rs` and
-//! `drill.rs` already exercise the four `PolicyAction` classes end-to-end
-//! through a representative sample of entrypoints. This module goes further
-//! for the `AdminConfig` class specifically (blocked only by `FullyPaused`,
-//! allowed in `ClaimsOnly`) by driving *every* entrypoint the docstring lists
-//! under that class through both cells:
+//! through each `PolicyAction` class (see `admin.rs`), and
+//! `docs/PAUSE_POLICY.md` is the prose version of the same table. `policy_gate.rs`
+//! and `drill.rs` already exercise the four classes end-to-end through a
+//! representative sample of entrypoints. This module drives *every* entrypoint
+//! each class owns through both cells that matter:
 //!
 //! - **`FullyPaused` → blocked**: every call must fail with exactly
 //!   `ContractError::ContractPaused`.
@@ -16,29 +16,50 @@
 //!   precondition like "no pending rotation"), which is fine: the property
 //!   under test is that the *policy gate* does not block it, not that the
 //!   call fully succeeds.
+//! - **`RoundMutation` in `ClaimsOnly` → blocked**: the one class `ClaimsOnly`
+//!   does stop, and the reason the mode exists.
 //!
-//! `create_round`/`create_next_from_template` are intentionally included:
-//! per the docstring they are `AdminConfig`-gated (not `RoundMutation`)
-//! specifically so they stay callable in `ClaimsOnly` — that's the entrypoint
-//! that transitions the protocol back to `Active`.
+//! `create_round`/`create_next_from_template` are intentionally in
+//! `AdminConfig` and not `RoundMutation`: they are the entrypoints that
+//! transition the protocol back out of `ClaimsOnly`, so they must stay callable
+//! in that mode.
 //!
-//! Two functions the docstring originally miscategorized are covered by
-//! dedicated tests below instead of the shared matrix helper, since they
-//! don't fit the "blocked only by FullyPaused" AdminConfig shape:
+//! Three functions deliberately sit outside the shared matrix helpers:
 //! - `set_runtime_mode` (along with `pause_contract`/`unpause_contract`) is a
 //!   mode-transition control that bypasses `_policy_gate` entirely — it must
 //!   stay callable in every mode, including `FullyPaused`, or there would be
 //!   no way to escape an incident.
-//! - `apply_scheduled_changes` is actually `RoundMutation`-gated
+//! - `apply_scheduled_changes` is `RoundMutation`-gated
 //!   (`_ensure_normal_mode`), not `AdminConfig` — it is blocked in
 //!   `ClaimsOnly` too, unlike the rest of the config surface.
+//! - `cancel_round` is documented as `Settlement` (so it should be blocked in
+//!   `FullyPaused`) but has no gate call at all.
+//!   `test_cancel_round_is_ungated_and_diverges_from_the_matrix` pins that
+//!   divergence so closing it is a deliberate, reviewable change.
+//!
+//! The `Claim` class gets the opposite treatment from the others: because
+//! "claims-only still allows claims" is the one cell where a passing test must
+//! prove money actually moved, it runs a full round → settle → escalate → claim
+//! cycle and checks the winner's balance grows by exactly the pending amount.
 
 use crate::contract::{VirtualTokenContract, VirtualTokenContractClient};
 use crate::errors::ContractError;
-use crate::types::ConfigChangeKind;
-use soroban_sdk::{testutils::Address as _, Address, Env};
+use crate::types::{BetSide, ConfigChangeKind, MultiFeedPayload, OraclePayload};
+use soroban_sdk::{
+    testutils::{Address as _, Ledger as _},
+    Address, BytesN, Env, Vec,
+};
+
+/// `ContractError::ContractPaused` as it surfaces on the wire. Used for the
+/// entrypoints that `panic_with_error!` instead of returning the error, so the
+/// contract error reaches the client as a host error rather than a typed value.
+const PAUSED_CODE: u32 = 22;
 
 fn setup(env: &Env) -> (VirtualTokenContractClient<'_>, Address) {
+    setup_with_id(env)
+}
+
+fn setup_with_id(env: &Env) -> (VirtualTokenContractClient<'_>, Address) {
     let contract_id = env.register(VirtualTokenContract, ());
     let client = VirtualTokenContractClient::new(env, &contract_id);
     let admin = Address::generate(env);
@@ -46,6 +67,96 @@ fn setup(env: &Env) -> (VirtualTokenContractClient<'_>, Address) {
     env.mock_all_auths();
     client.initialize(&admin, &oracle);
     (client, admin)
+}
+
+/// Single-feed oracle payload. `round_id` is the round's `start_ledger`, which
+/// is what the contract's round-relative timestamp window is keyed off.
+fn oracle_payload(
+    env: &Env,
+    contract_id: &Address,
+    price: u128,
+    round_id: u32,
+    nonce: u64,
+) -> OraclePayload {
+    OraclePayload {
+        price,
+        timestamp: env.ledger().timestamp(),
+        round_id,
+        nonce,
+        network_id: env.ledger().network_id(),
+        contract_addr: contract_id.clone(),
+        confidence: None,
+        attestation: None,
+    }
+}
+
+/// Multi-feed oracle payload over a single source.
+fn multi_feed_payload(
+    env: &Env,
+    contract_id: &Address,
+    price: u128,
+    round_id: u32,
+    nonce: u64,
+) -> MultiFeedPayload {
+    let mut prices = Vec::new(env);
+    prices.push_back(price);
+    let mut sources = Vec::new(env);
+    sources.push_back(1u32);
+    MultiFeedPayload {
+        prices,
+        sources,
+        round_id,
+        nonce,
+        network_id: env.ledger().network_id(),
+        contract_addr: contract_id.clone(),
+        timestamp: env.ledger().timestamp(),
+    }
+}
+
+/// Creates a round, has `winner` bet Up and `loser` bet Down, then settles it
+/// so `winner` is owed winnings and `loser` is owed nothing.
+///
+/// The ledger *timestamp* is deliberately left at 0: the oracle timestamp
+/// window is `[round.start_timestamp - skew, round.start_timestamp + duration
+/// * 5 + skew]`, and `start_timestamp` is captured at creation from the ledger
+/// timestamp. Advancing the clock without advancing it in lockstep would push
+/// the payload outside that window and fail with
+/// `OracleTimestampOutsideWindow` before the policy gate is ever reached.
+fn round_settled_in_favour_of(
+    env: &Env,
+    client: &VirtualTokenContractClient,
+    contract_id: &Address,
+    winner: &Address,
+    loser: &Address,
+) -> u32 {
+    client.mint_initial(winner);
+    client.mint_initial(loser);
+    client.create_round(&1_0000000, &None);
+    client.place_bet(winner, &100_0000000, &BetSide::Up);
+    client.place_bet(loser, &100_0000000, &BetSide::Down);
+
+    let start_ledger = client
+        .get_active_round()
+        .map(|r| r.start_ledger)
+        .unwrap_or(0);
+
+    // Past the end of the run window, but without moving the clock. The oracle
+    // heartbeat is recorded at the current (zero) timestamp so the settlement
+    // health gate sees a live oracle — a missing heartbeat blocks resolution
+    // regardless of strict mode.
+    client.update_oracle_heartbeat(&0u32);
+    env.ledger().with_mut(|li| {
+        li.sequence_number = start_ledger + 12;
+    });
+
+    client.resolve_round(&oracle_payload(
+        env,
+        contract_id,
+        1_2000000,
+        start_ledger,
+        1u64,
+    ));
+    start_ledger
 }
 
 /// Calls every `AdminConfig`-gated entrypoint (excluding the mode-transition
@@ -341,4 +452,403 @@ fn test_apply_scheduled_changes_is_blocked_in_claims_only_and_fully_paused() {
         client.try_apply_scheduled_changes(&ConfigChangeKind::MinBet),
         Err(Ok(ContractError::ContractPaused))
     );
+}
+
+// ─── `RoundMutation` (Issue #551) ────────────────────────────────────────────
+
+/// Drives every `RoundMutation`-gated entrypoint listed in `_policy_gate`'s doc
+/// comment (see `admin.rs`) and in `docs/PAUSE_POLICY.md` §3.1, returning
+/// `(name, is_contract_paused)` pairs.
+///
+/// `_ensure_normal_mode` is the first substantive check in every one of these,
+/// so a correct implementation rejects with `ContractPaused` regardless of
+/// whether the round/mint preconditions would otherwise be satisfied. The
+/// caller is still set up with a live round and a funded user so that a
+/// regression which *reorders* the gate behind a precondition shows up as a
+/// failure rather than a false pass.
+fn call_every_round_mutation_entrypoint(
+    client: &VirtualTokenContractClient,
+    env: &Env,
+    contract_id: &Address,
+    user: &Address,
+) -> alloc::vec::Vec<(&'static str, bool)> {
+    use alloc::vec;
+
+    let gated = |name: &'static str, res: bool| (name, res);
+    let fresh_user = Address::generate(env);
+    let start_ledger = client
+        .get_active_round()
+        .map(|r| r.start_ledger)
+        .unwrap_or(0);
+
+    vec![
+        gated(
+            "place_bet",
+            client.try_place_bet(user, &10_0000000, &BetSide::Up)
+                == Err(Ok(ContractError::ContractPaused)),
+        ),
+        gated(
+            "place_precision_prediction",
+            client.try_place_precision_prediction(user, &10_0000000, &1550)
+                == Err(Ok(ContractError::ContractPaused)),
+        ),
+        gated(
+            "predict_price",
+            client.try_predict_price(user, &1550, &10_0000000)
+                == Err(Ok(ContractError::ContractPaused)),
+        ),
+        gated(
+            "commit_prediction",
+            client.try_commit_prediction(user, &BytesN::from_array(env, &[0u8; 32]), &10_0000000)
+                == Err(Ok(ContractError::ContractPaused)),
+        ),
+        gated(
+            "reveal_prediction",
+            client.try_reveal_prediction(user, &1550, &BytesN::from_array(env, &[1u8; 32]))
+                == Err(Ok(ContractError::ContractPaused)),
+        ),
+        gated(
+            "cash_out_early",
+            client.try_cash_out_early(user) == Err(Ok(ContractError::ContractPaused)),
+        ),
+        gated(
+            "mint_initial",
+            // `mint_initial` returns `i128` and reports failures with
+            // `panic_with_error!`, so the contract error reaches the client as a
+            // host `Error::Contract(22)` rather than a typed `ContractError`.
+            client.try_mint_initial(&fresh_user)
+                == Err(Ok(soroban_sdk::Error::from_contract_error(PAUSED_CODE))),
+        ),
+        gated(
+            "apply_scheduled_changes",
+            client.try_apply_scheduled_changes(&ConfigChangeKind::MinBet)
+                == Err(Ok(ContractError::ContractPaused)),
+        ),
+        gated(
+            "resolve_round_is_not_round_mutation",
+            client.try_resolve_round(&oracle_payload(
+                env,
+                contract_id,
+                1_2000000,
+                start_ledger,
+                9,
+            )) != Err(Ok(ContractError::ContractPaused)),
+        ),
+    ]
+}
+
+#[test]
+fn test_claims_only_blocks_every_round_mutation_entrypoint() {
+    let env = Env::default();
+    let (client, _admin) = setup_with_id(&env);
+    let contract_id = client.address.clone();
+    let user = Address::generate(&env);
+
+    client.create_round(&1_0000000, &None);
+    client.mint_initial(&user);
+
+    client.set_runtime_mode(&1u32); // ClaimsOnly
+    assert_eq!(client.get_runtime_mode(), 1u32);
+
+    let results = call_every_round_mutation_entrypoint(&client, &env, &contract_id, &user);
+    let not_blocked: alloc::vec::Vec<&str> = results
+        .iter()
+        .filter(|(name, blocked)| !*blocked && *name != "resolve_round_is_not_round_mutation")
+        .map(|(name, _)| *name)
+        .collect();
+    assert!(
+        not_blocked.is_empty(),
+        "ClaimsOnly must block every RoundMutation entrypoint with ContractPaused; \
+         these were not blocked: {:?}",
+        not_blocked
+    );
+}
+
+#[test]
+fn test_fully_paused_blocks_every_round_mutation_entrypoint() {
+    let env = Env::default();
+    let (client, _admin) = setup_with_id(&env);
+    let contract_id = client.address.clone();
+    let user = Address::generate(&env);
+
+    client.create_round(&1_0000000, &None);
+    client.mint_initial(&user);
+
+    client.pause_contract();
+    assert!(client.is_paused());
+
+    let results = call_every_round_mutation_entrypoint(&client, &env, &contract_id, &user);
+    let not_blocked: alloc::vec::Vec<&str> = results
+        .iter()
+        .filter(|(name, blocked)| !*blocked && *name != "resolve_round_is_not_round_mutation")
+        .map(|(name, _)| *name)
+        .collect();
+    assert!(
+        not_blocked.is_empty(),
+        "FullyPaused must block every RoundMutation entrypoint with ContractPaused; \
+         these were not blocked: {:?}",
+        not_blocked
+    );
+}
+
+#[test]
+fn test_claims_only_does_not_block_the_rest_of_the_matrix() {
+    let env = Env::default();
+    let (client, _admin) = setup(&env);
+
+    client.set_runtime_mode(&1u32); // ClaimsOnly
+    assert!(client.is_action_allowed(&crate::types::PolicyAction::Claim));
+    assert!(client.is_action_allowed(&crate::types::PolicyAction::Settlement));
+    assert!(client.is_action_allowed(&crate::types::PolicyAction::AdminConfig));
+    assert!(!client.is_action_allowed(&crate::types::PolicyAction::RoundMutation));
+}
+
+// ─── `Claim` (Issue #551) ────────────────────────────────────────────────────
+
+/// Drives every `Claim`-gated entrypoint. Returns `(name, result)` so a single
+/// test can assert the whole class at once.
+fn call_every_claim_entrypoint(
+    client: &VirtualTokenContractClient,
+    env: &Env,
+    users: &soroban_sdk::Vec<Address>,
+) -> alloc::vec::Vec<(&'static str, bool)> {
+    use alloc::vec;
+
+    vec![
+        (
+            "claim_winnings",
+            client.try_claim_winnings(&users.get(0).unwrap())
+                == Err(Ok(ContractError::ContractPaused)),
+        ),
+        (
+            "claim_many",
+            client.try_claim_many(users) == Err(Ok(ContractError::ContractPaused)),
+        ),
+    ]
+}
+
+/// Acceptance criterion for #551: **ClaimsOnly allows claims.**
+///
+/// This is the one cell that is not a "does the gate fire?" check — it proves
+/// the money actually moves. A real round is settled, so the winner holds
+/// pending winnings, and the protocol is escalated to `ClaimsOnly` *before* the
+/// claim. The claim must succeed and the balance must grow by exactly the
+/// pending amount; the same claim must then be rejected under `FullyPaused`.
+#[test]
+fn test_claims_only_allows_claims_and_fully_paused_denies_them() {
+    let env = Env::default();
+    let (client, _admin) = setup_with_id(&env);
+    let contract_id = client.address.clone();
+
+    let winner = Address::generate(&env);
+    let loser = Address::generate(&env);
+    round_settled_in_favour_of(&env, &client, &contract_id, &winner, &loser);
+
+    let owed = client.get_pending_winnings(&winner);
+    assert!(owed > 0, "winner must be owed winnings before the incident");
+    assert_eq!(client.get_pending_winnings(&loser), 0);
+
+    // ── ClaimsOnly: the claim goes through and the funds land ───────────────
+    client.set_runtime_mode(&1u32);
+    assert_eq!(client.get_runtime_mode(), 1u32);
+    assert!(!client.is_paused(), "ClaimsOnly is not FullyPaused");
+
+    let balance_before = client.balance(&winner);
+    let claimed = client.claim_winnings(&winner);
+    assert_eq!(
+        claimed, owed,
+        "claims-only must pay out the full pending amount"
+    );
+    assert_eq!(client.balance(&winner), balance_before + owed);
+    assert_eq!(client.get_pending_winnings(&winner), 0);
+
+    // A zero-pending claim stays a no-op success, not an error.
+    assert_eq!(client.claim_winnings(&loser), 0);
+
+    // The batch sibling behaves identically.
+    let mut batch = Vec::new(&env);
+    batch.push_back(winner.clone());
+    batch.push_back(loser.clone());
+    let amounts = client.claim_many(&batch);
+    let mut expected_zeroes = Vec::new(&env);
+    expected_zeroes.push_back(0i128);
+    expected_zeroes.push_back(0i128);
+    assert_eq!(
+        amounts, expected_zeroes,
+        "re-claiming an already-settled winner yields 0, not an error"
+    );
+
+    let gated = call_every_claim_entrypoint(&client, &env, &batch);
+    let wrongly_blocked: alloc::vec::Vec<&str> = gated
+        .iter()
+        .filter(|(_, blocked)| *blocked)
+        .map(|(name, _)| *name)
+        .collect();
+    assert!(
+        wrongly_blocked.is_empty(),
+        "ClaimsOnly must not block any Claim entrypoint; these were wrongly gated: {:?}",
+        wrongly_blocked
+    );
+
+    // ── FullyPaused: the same claims are refused ───────────────────────────
+    client.set_runtime_mode(&2u32);
+    assert!(client.is_paused());
+
+    let gated = call_every_claim_entrypoint(&client, &env, &batch);
+    let not_blocked: alloc::vec::Vec<&str> = gated
+        .iter()
+        .filter(|(_, blocked)| !*blocked)
+        .map(|(name, _)| *name)
+        .collect();
+    assert!(
+        not_blocked.is_empty(),
+        "FullyPaused must block every Claim entrypoint with ContractPaused; \
+         these were not blocked: {:?}",
+        not_blocked
+    );
+}
+
+// ─── `Settlement` (Issue #551) ───────────────────────────────────────────────
+
+/// Drives every `Settlement`-gated entrypoint listed in `docs/PAUSE_POLICY.md`
+/// §3.3.
+///
+/// `cancel_round` is included but is *expected* to come back un-gated — it has
+/// no `_policy_gate` call at all, which is a live divergence from the
+/// documented matrix. `test_cancel_round_is_ungated_and_diverges_from_the_matrix`
+/// pins that divergence explicitly; here it is filtered out of the FullyPaused
+/// assertion so the rest of the class is still enforced.
+fn call_every_settlement_entrypoint(
+    client: &VirtualTokenContractClient,
+    env: &Env,
+    contract_id: &Address,
+) -> alloc::vec::Vec<(&'static str, bool)> {
+    use alloc::vec;
+
+    let gated = |name: &'static str, res: bool| (name, res);
+    let start_ledger = client
+        .get_active_round()
+        .map(|r| r.start_ledger)
+        .unwrap_or(0);
+
+    vec![
+        gated(
+            "resolve_round",
+            client.try_resolve_round(&oracle_payload(
+                env,
+                contract_id,
+                1_2000000,
+                start_ledger,
+                1,
+            )) == Err(Ok(ContractError::ContractPaused)),
+        ),
+        gated(
+            "resolve_round_multi",
+            client.try_resolve_round_multi(&multi_feed_payload(
+                env,
+                contract_id,
+                1_2000000,
+                start_ledger,
+                1,
+            )) == Err(Ok(ContractError::ContractPaused)),
+        ),
+        gated(
+            "void_round",
+            client.try_void_round(&u64::from(start_ledger))
+                == Err(Ok(ContractError::ContractPaused)),
+        ),
+        gated(
+            "finalize_round",
+            client.try_finalize_round(&u64::from(start_ledger))
+                == Err(Ok(ContractError::ContractPaused)),
+        ),
+        gated(
+            "cancel_round",
+            client.try_cancel_round(&crate::types::CANCEL_REASON_GENERIC)
+                == Err(Ok(ContractError::ContractPaused)),
+        ),
+    ]
+}
+
+#[test]
+fn test_claims_only_does_not_block_settlement() {
+    let env = Env::default();
+    let (client, _admin) = setup_with_id(&env);
+    let contract_id = client.address.clone();
+
+    client.create_round(&1_0000000, &None);
+    client.set_runtime_mode(&1u32); // ClaimsOnly
+
+    let results = call_every_settlement_entrypoint(&client, &env, &contract_id);
+    let wrongly_blocked: alloc::vec::Vec<&str> = results
+        .iter()
+        .filter(|(_, blocked)| *blocked)
+        .map(|(name, _)| *name)
+        .collect();
+    assert!(
+        wrongly_blocked.is_empty(),
+        "ClaimsOnly must not block any Settlement entrypoint via the policy gate; \
+         these were wrongly gated: {:?}",
+        wrongly_blocked
+    );
+}
+
+#[test]
+fn test_fully_paused_blocks_settlement() {
+    let env = Env::default();
+    let (client, _admin) = setup_with_id(&env);
+    let contract_id = client.address.clone();
+
+    client.create_round(&1_0000000, &None);
+    client.pause_contract();
+    assert!(client.is_paused());
+
+    let results = call_every_settlement_entrypoint(&client, &env, &contract_id);
+    let not_blocked: alloc::vec::Vec<&str> = results
+        .iter()
+        // `cancel_round` has no policy gate at all — see the dedicated test.
+        .filter(|(name, blocked)| !*blocked && *name != "cancel_round")
+        .map(|(name, _)| *name)
+        .collect();
+    assert!(
+        not_blocked.is_empty(),
+        "FullyPaused must block every gated Settlement entrypoint with ContractPaused; \
+         these were not blocked: {:?}",
+        not_blocked
+    );
+}
+
+/// Pins a real divergence between the documented matrix and the implementation.
+///
+/// `docs/PAUSE_POLICY.md` and `_policy_gate`'s doc comment both list
+/// `cancel_round` under the `Settlement` class, which is blocked in
+/// `FullyPaused`. The implementation has no `_policy_gate` /
+/// `_ensure_not_paused` call in `settlement::cancel_round`, so an emergency
+/// stop does **not** stop a cancellation.
+///
+/// Cancelling only returns stakes, so the current behaviour is not obviously
+/// harmful — but "the emergency stop does not stop this" is a decision that
+/// belongs to maintainers, not to whatever the code happens to do today. This
+/// test records the current behaviour so that closing the gap is a deliberate,
+// reviewable change to an assertion rather than a silent drift.
+#[test]
+fn test_cancel_round_is_ungated_and_diverges_from_the_matrix() {
+    let env = Env::default();
+    let (client, _admin) = setup(&env);
+
+    client.create_round(&1_0000000, &None);
+    client.pause_contract();
+    assert!(client.is_paused());
+
+    assert_ne!(
+        client.try_cancel_round(&crate::types::CANCEL_REASON_GENERIC),
+        Err(Ok(ContractError::ContractPaused)),
+        "cancel_round currently has no policy gate: the documented Settlement \
+         class says FullyPaused must block it. If this now fails, the gate was \
+         added — update docs/PAUSE_POLICY.md and the doc comment on \
+         admin::_policy_gate to drop the divergence note."
+    );
+    // The round is gone, so the call really did execute rather than fail on
+    // some unrelated precondition.
+    assert!(client.get_active_round().is_none());
 }

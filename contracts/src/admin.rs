@@ -914,17 +914,25 @@ fn _current_mode(env: &Env) -> RuntimeMode {
 ///
 /// ## Entrypoint inventory (action → dispatcher, `contract.rs`)
 ///
+/// The canonical, always-current version of this inventory — including the
+/// entrypoints added after this comment was first written — is
+/// `docs/PAUSE_POLICY.md`, and every cell below is enforced by
+/// `tests/pause_policy_matrix.rs`. Keep the three in sync when adding an
+/// entrypoint.
+///
 /// - `RoundMutation`: `place_bet`, `place_precision_prediction`,
 ///   `predict_price`, `commit_prediction`, `reveal_prediction`,
-///   `mint_initial`, `apply_scheduled_changes` (activating a timelocked
-///   config change is treated as mutation-adjacent — it is deliberately
-///   blocked in `ClaimsOnly` too, unlike the rest of the config surface, so
-///   an incident freezes pending config activations along with new bets).
-///   `cancel_config_change` is *not* in this class — cancelling a pending
-///   change is `AdminConfig` below, so an operator can always back out a
-///   scheduled change even while `ClaimsOnly`.
-/// - `Claim`: `claim_winnings`.
-/// - `Settlement`: `resolve_round`, `cancel_round`.
+///   `cash_out_early`, `mint_initial`, `apply_scheduled_changes`
+///   (activating a timelocked config change is treated as mutation-adjacent —
+///   it is deliberately blocked in `ClaimsOnly` too, unlike the rest of the
+///   config surface, so an incident freezes pending config activations along
+///   with new bets). `cancel_config_change` is *not* in this class —
+///   cancelling a pending change is `AdminConfig` below, so an operator can
+///   always back out a scheduled change even while `ClaimsOnly`.
+/// - `Claim`: `claim_winnings`, `claim_many`.
+/// - `Settlement`: `resolve_round`, `resolve_round_multi`, `cancel_round`,
+///   `void_round`, `finalize_round`. See the divergence note below on
+///   `cancel_round`.
 /// - Mode-transition controls — `pause_contract`, `unpause_contract`,
 ///   `set_runtime_mode` — call `_set_mode` directly and are **not** routed
 ///   through `_policy_gate` at all: they must stay callable in every mode,
@@ -933,18 +941,28 @@ fn _current_mode(env: &Env) -> RuntimeMode {
 ///   `GovUnauthorized` when a governance approver is configured — just not by
 ///   the runtime-mode gate.) Do not add a `_policy_gate` call to these.
 /// - `AdminConfig`: `migrate_schema_v1_to_v2`, `migrate_schema_v2_to_v3`,
-///   `set_oracle_max_deviation_bps`, `arm_oracle_deviation_override`,
+///   `set_oracle_max_deviation_bps`, `set_deviation_ref_mode`,
+///   `set_attestation_key`, `arm_oracle_deviation_override`,
 ///   `set_oracle_min_confidence_bps`, `set_oracle_strict_mode`,
 ///   `set_hb_strict_mode`, `arm_hb_override`, `set_hb_grace_seconds`,
+///   `set_oracle_quorum_config`, `set_oracle_stale_threshold`,
 ///   `propose_oracle_rotation`, `accept_oracle_rotation`,
-///   `cancel_oracle_rotation`, `set_windows`, `set_max_stake`,
+///   `cancel_oracle_rotation`, `set_access_control_enabled`,
+///   `add_allowlisted`, `remove_allowlisted`, `add_denylisted`,
+///   `remove_denylisted`, `set_windows`, `set_max_stake`,
 ///   `set_max_user_exposure`, `set_max_pending_winnings`, `set_min_bet`,
+///   `set_precision_payout_policy`, `set_min_participants`,
+///   `set_max_precision_participants`, `set_early_cashout_bps`,
+///   `set_dispute_ledgers`, `set_close_buffer_ledgers`, `set_mint_limit`,
+///   `set_epoch_mint_budget`, `set_pending_winnings_expiry`,
 ///   `schedule_*` variants, `cancel_config_change`,
-///   `set_protocol_fee_bps`, `withdraw_protocol_fee`, `set_min_participants`,
-///   `set_max_precision_participants`, `set_mint_limit`,
-///   `set_archive_retention`, `set_close_buffer_ledgers`,
-///   `set_round_template`, `clear_round_template`,
-///   `reset_leaderboard_season`, `create_round`, `create_next_from_template`
+///   `set_protocol_fee_bps`, `withdraw_protocol_fee`, `set_fee_model`,
+///   `set_insurance_split_bps`, `set_insurance_coverage_bps`,
+///   `set_insurance_eligible_events`, `top_up_insurance_fund`,
+///   `withdraw_insurance_fund`, `set_archive_retention`,
+///   `reclaim_expired_pending_winnings`, `batch_touch_ttl`,
+///   `reset_leaderboard_season`, `set_round_template`,
+///   `clear_round_template`, `create_round`, `create_next_from_template`
 ///   (admin-gated, not `RoundMutation` — must stay callable in `ClaimsOnly`
 ///   since it is the entrypoint that transitions the protocol back to
 ///   `Active`; it is blocked only by `FullyPaused`).
@@ -953,6 +971,22 @@ fn _current_mode(env: &Env) -> RuntimeMode {
 /// intentionally not gated: heartbeat recording must keep flowing even while
 /// paused so `get_protocol_health` reflects live oracle status during an
 /// incident, and reads never mutate state.
+///
+/// ## Known divergences from the table above (Issue #551)
+///
+/// Two surfaces are documented in a class but are not actually gated. Both
+/// are recorded in `docs/PAUSE_POLICY.md` §4 and pinned by tests so they
+/// cannot drift unnoticed — they are **not** endorsed:
+///
+/// - `cancel_round` is listed under `Settlement` here, but
+///   `settlement::cancel_round` contains no `_policy_gate` /
+///   `_ensure_not_paused` call, so `FullyPaused` does not stop it.
+/// - No function in `governance.rs` calls the gate at all, so
+///   `execute_gov_proposal`, `set_gov_approver`, `establish_constitution`,
+///   `activate_amendment` and the rest of the governance surface remain
+///   callable while `FullyPaused`. `announce_next_schema` and
+///   `clear_next_schema` are likewise ungated (low impact: the migrations they
+///   announce are `AdminConfig`-gated).
 pub fn _policy_gate(env: &Env, action: PolicyAction) -> Result<(), ContractError> {
     let mode = _current_mode(env);
     let blocked = match action {

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! Type definitions for the XLM Price Prediction Market.
 
-use soroban_sdk::{contracttype, Address, BytesN, Vec};
+use soroban_sdk::{contracttype, Address, BytesN, Symbol, Vec};
 
 /// Round mode for prediction type
 #[contracttype]
@@ -1004,7 +1004,14 @@ pub struct Amendment {
     pub id: u64,
     pub proposer: Address,
     pub parameter_name: Symbol,
-    pub new_value: Val,
+    /// Proposed value of the parameter named by `parameter_name`.
+    ///
+    /// Every governance-classified parameter in this protocol is an integer
+    /// (ledger counts, basis points, stroop amounts), so the amendment payload
+    /// is an `i128`. A raw `soroban_sdk::Val` cannot be used here: `Val` is a
+    /// host-side handle with no `#[contracttype]` conversion, so it breaks both
+    /// `PartialEq` and the generated XDR/spec conversions.
+    pub new_value: i128,
     pub created_at_ledger: u32,
     pub veto_deadline_ledger: u32,
     pub activation_deadline_ledger: u32,

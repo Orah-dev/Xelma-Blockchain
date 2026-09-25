@@ -25,6 +25,13 @@ The protocol supports three distinct operational runtime states:
 | | Emergency mode transitions | ✅ Allowed | ✅ Allowed | ✅ Allowed (`unpause_contract`) |
 | **Queries & Diagnostics** | Read-only state queries | ✅ Allowed | ✅ Allowed | ✅ Allowed |
 
+> **Authoritative version:** [PAUSE_POLICY.md](./PAUSE_POLICY.md) maps the same
+> three modes onto the four `PolicyAction` classes the contract actually gates
+> on, lists the full entrypoint inventory, and names the test that enforces
+> every cell. It also records two surfaces (§4) that this table does not cover
+> because they are not gated: `cancel_round` and the whole `governance.rs`
+> surface stay callable while `FullyPaused`.
+
 ---
 
 ## 2. Incident Lifecycle & Escalation Path
@@ -66,6 +73,8 @@ The protocol supports three distinct operational runtime states:
 ## 3. Automated Emergency Drill Suite
 
 The protocol's incident behavior is validated deterministically in `contracts/src/tests/drill.rs`.
+The per-mode × per-class permission matrix itself is covered in
+`contracts/src/tests/pause_policy_matrix.rs` (see [PAUSE_POLICY.md §5](./PAUSE_POLICY.md#5-test-coverage)).
 
 ### Drill Test Coverage
 
