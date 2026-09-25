@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: MIT
 //! Adversarial commit-reveal grinding scenarios (Issue #414).
 //!
+//! Filed as `adversarial_grinding.rs` rather than `adversarial.rs` because the
+//! `adversarial/` directory holds the separate Issue #372 economic suite; the
+//! two collided on the `adversarial` module name.
+//!
 //! This module exercises grinding, griefing, and manipulation attempts against
 //! the Precision-mode commit-reveal pipeline, asserting that protocol defenses
 //! neutralize each attack vector.
@@ -18,7 +22,10 @@
 //! mock auths, round creation at ledger 0, bet window = [0, 6),
 //! reveal window = [6, 12), resolve at ≥ 12.
 
-use soroban_sdk::{testutils::Address as _, Address, Bytes, BytesN, Env, TryFromVal};
+use soroban_sdk::{
+    testutils::{Address as _, Ledger as _},
+    Address, Bytes, BytesN, Env, TryFromVal,
+};
 use soroban_sdk::xdr::ToXdr;
 
 use crate::contract::{VirtualTokenContract, VirtualTokenContractClient};

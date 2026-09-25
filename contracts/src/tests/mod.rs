@@ -2,6 +2,7 @@
 //! Test modules for the XLM Price Prediction Market contract.
 
 mod adversarial;
+mod adversarial_grinding;
 mod archive_retention;
 mod cancel_refund_matrix;
 mod attestation;
