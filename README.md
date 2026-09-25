@@ -194,6 +194,11 @@ Recovery workflow:
 
 Use `is_paused()` to verify the current contract state before attempting recovery actions.
 
+The full permission matrix — which action classes each mode allows or blocks,
+the complete entrypoint inventory, and the test that enforces every cell — is
+in [docs/PAUSE_POLICY.md](./docs/PAUSE_POLICY.md). The operational drill is in
+[docs/EMERGENCY_DRILL.md](./docs/EMERGENCY_DRILL.md).
+
 ### Precision Participant Cap
 
 Precision rounds enforce a configurable participant cap to keep storage growth and resolution cost predictable. The default cap is **1,000 participants** per Precision round. Admins can tune it with `set_max_precision_participants(max)` within the supported range of `1` to `10,000`; use `get_max_precision_participants()` to confirm the active value.
