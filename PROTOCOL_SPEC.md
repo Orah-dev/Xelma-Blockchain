@@ -112,14 +112,36 @@ Evidence:
 - Code: `require_auth()` calls in admin, oracle, and user entrypoints.
 - Tests: `initialization.rs`, `lifecycle.rs`, `pause.rs`, `windows.rs`, `security.rs`.
 
-### I3. Pause Safety
+### I3. Pause Safety and Runtime Policy Matrix
 
-When paused, high-risk mutating operations are rejected. Read-only queries remain
-available so operators can inspect contract state during an incident.
+Every mutating entrypoint is assigned to one of four `PolicyAction` classes and
+checked by the central `_policy_gate`. `Normal` permits every class.
+`ClaimsOnly` blocks new round participation while preserving claims, settlement
+of in-flight rounds, and operator recovery controls. `FullyPaused` blocks every
+policy-gated class; read-only queries and authenticated mode-transition controls
+remain available.
+
+| `PolicyAction` | Representative entrypoints | `Normal` | `ClaimsOnly` | `FullyPaused` |
+|---|---|:---:|:---:|:---:|
+| `RoundMutation` | `place_bet`, direct/commit/reveal Precision actions, `mint_initial`, scheduled config activation | Allow | Deny (`ContractPaused`) | Deny (`ContractPaused`) |
+| `Claim` | `claim_winnings`, `claim_many` | Allow | **Allow** | Deny (`ContractPaused`) |
+| `Settlement` | `resolve_round`, `resolve_round_multi`, `cancel_round`, `void_round`, `finalize_round` | Allow | Allow | Deny (`ContractPaused`) |
+| `AdminConfig` | configuration setters, `create_round`, template creation, fee withdrawal | Allow | Allow | Deny (`ContractPaused`) |
+
+Mode-transition controls (`set_runtime_mode`, `pause_contract`, and
+`unpause_contract`) intentionally bypass `_policy_gate`; otherwise a fully
+paused contract could not be recovered. `create_round` is `AdminConfig` rather
+than `RoundMutation` so an operator can transition an idle `ClaimsOnly` market
+back to a new active round. Oracle heartbeat updates and read-only queries are
+also intentionally ungated so health diagnostics remain available during an
+incident.
 
 Evidence:
-- Code: `_ensure_not_paused`, `pause_contract`, `unpause_contract`.
-- Tests: `pause.rs`, `chaos_recovery.rs::test_chaos_pause_mid_round_then_unpause_resolve`.
+- Code: `admin::_policy_gate`, `pause_contract`, `unpause_contract`, and the
+  explicit `PolicyAction` checks in claim and settlement entrypoints.
+- Tests: `policy_gate.rs` (query matrix plus real claim allow/deny behavior),
+  `pause_policy_matrix.rs`, `pause.rs`, and
+  `chaos_recovery.rs::test_chaos_pause_mid_round_then_unpause_resolve`.
 
 ### I4. Round Timing
 

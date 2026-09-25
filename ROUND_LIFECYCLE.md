@@ -23,6 +23,40 @@
                     (ledger ≥ end_ledger)
 ```
 
+## Phase × Action Matrix
+
+The active phase is derived from the current ledger and has identical timing
+boundaries for both round modes. `cancel_round` is the recovery edge available
+from every active phase. All other denied edges return the specific contract
+error shown below.
+
+| Phase | Ledger range | Up/Down actions | Precision actions | Common terminal action | Rejected phase edges |
+|---|---|---|---|---|---|
+| `Betting` | `ledger < bet_end_ledger` | `place_bet` | `place_precision_prediction`, `commit_prediction` | `cancel_round` | Reveal → `InvalidRevealWindow`; resolve → `RoundNotEnded`; late bet/prediction → `RoundEnded` |
+| `Running` | `bet_end_ledger ≤ ledger < end_ledger` | No new position (optional enabled `cash_out_early` only) | `reveal_prediction` | `cancel_round` | Bet/predict/commit → `RoundEnded`; resolve → `RoundNotEnded`; cross-mode action → `WrongModeForPrediction` |
+| `AwaitingResolve` | `ledger ≥ end_ledger` | Settlement only | Settlement only | `resolve_round` or `cancel_round` | Bet/predict/commit → `RoundEnded`; reveal → `InvalidRevealWindow` |
+
+Mode isolation is orthogonal to timing and is enforced in every phase: Up/Down
+bets and commit/reveal actions require `RoundMode::UpDown` and `Precision` actions
+require `RoundMode::Precision`; cross-mode attempts return
+`WrongModeForPrediction`.
+
+The legal state edges are identical for Up/Down and Precision:
+
+| From | Trigger | To |
+|---|---|---|
+| `Unknown` | `create_round` | `Betting` |
+| `Betting` | `ledger ≥ bet_end_ledger` | `Running` |
+| `Running` | `ledger ≥ end_ledger` | `AwaitingResolve` |
+| `AwaitingResolve` | successful competitive settlement | `Resolved` |
+| `AwaitingResolve` | settlement below `min_participants` | `FallbackRefund` |
+| `Betting`, `Running`, or `AwaitingResolve` | `cancel_round` | `Cancelled` |
+
+Terminal states have no active round. A second `cancel_round` returns
+`RoundNotCancellable`, while settlement after a terminal transition returns
+`NoActiveRound`. A replacement round may only be created after the ledger
+advances so its oracle `start_ledger` binding remains unique.
+
 ## Single-Active-Round Invariant
 
 **At most one round may be in the Active state at any point in time.**

@@ -923,8 +923,9 @@ fn _current_mode(env: &Env) -> RuntimeMode {
 ///   `cancel_config_change` is *not* in this class — cancelling a pending
 ///   change is `AdminConfig` below, so an operator can always back out a
 ///   scheduled change even while `ClaimsOnly`.
-/// - `Claim`: `claim_winnings`.
-/// - `Settlement`: `resolve_round`, `cancel_round`.
+/// - `Claim`: `claim_winnings`, `claim_many`.
+/// - `Settlement`: `resolve_round`, `resolve_round_multi`, `cancel_round`,
+///   `void_round`, `finalize_round`.
 /// - Mode-transition controls — `pause_contract`, `unpause_contract`,
 ///   `set_runtime_mode` — call `_set_mode` directly and are **not** routed
 ///   through `_policy_gate` at all: they must stay callable in every mode,

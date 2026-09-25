@@ -3,7 +3,7 @@ extern crate alloc;
 use alloc::vec::Vec as StdVec;
 use crate::admin::{
     _ensure_not_paused, _load_attestation_config, _load_deviation_config, _load_hb_config,
-    _require_supported_schema,
+    _policy_gate, _require_supported_schema,
 };
 use crate::common::{
     _accumulate_pending, _emit_action_rejected, _extend_persistent_ttl, _extend_ttl_symbol,
@@ -23,8 +23,9 @@ use crate::storage::clear_round_storage;
 use crate::types::{
     ArchivedRoundSummary, BetSide, DataKeyCore, DataKeyScoped, DeviationReferenceMode,
     HbGateConfig, LeaderboardEntry, MultiFeedPayload, OracleHeartbeatRecord, OraclePayload,
-    OracleQuorumConfig, OneSidedPolicy, PendingWinningsUpdatedAtKey, PrecisionCommitment,
-    PrecisionPayoutPolicy, PrecisionPrediction, PriceSample, Round, RoundArchiveStatus, RoundMode,
+    OracleQuorumConfig, OneSidedPolicy, PendingWinningsUpdatedAtKey, PolicyAction,
+    PrecisionCommitment, PrecisionPayoutPolicy, PrecisionPrediction, PriceSample, Round,
+    RoundArchiveStatus, RoundMode,
     TwapSamplesKey, UserOutcomeType, UserPosition, UserRoundOutcome, UserStats,
 };
 use soroban_sdk::xdr::ToXdr;
@@ -129,6 +130,9 @@ pub fn cancel_round(env: Env, reason: u32) -> Result<(), ContractError> {
         .get(&DataKeyCore::Admin)
         .ok_or(ContractError::AdminNotSet)?;
     admin.require_auth();
+    _policy_gate(&env, PolicyAction::Settlement).inspect_err(|&e| {
+        _emit_action_rejected(&env, &admin, symbol_short!("cancel"), e);
+    })?;
 
     let round: Round = env
         .storage()
@@ -370,7 +374,7 @@ pub fn claim_winnings(env: Env, user: Address) -> Result<i128, ContractError> {
     // ── Checks ────────────────────────────────────────────────────────────
     _require_supported_schema(&env)?;
     user.require_auth();
-    _ensure_not_paused(&env)?; // rejects FullyPaused; allows Normal & ClaimsOnly
+    _policy_gate(&env, PolicyAction::Claim)?; // rejects FullyPaused; allows Normal & ClaimsOnly
 
     let key = DataKeyScoped::PendingWinnings(user.clone());
     let pending: i128 = env.storage().persistent().get(&key).unwrap_or(0);
@@ -447,7 +451,7 @@ pub fn claim_winnings(env: Env, user: Address) -> Result<i128, ContractError> {
 pub fn claim_many(env: Env, users: Vec<Address>) -> Result<Vec<i128>, ContractError> {
     // ── Checks ────────────────────────────────────────────────────────────
     _require_supported_schema(&env)?;
-    _ensure_not_paused(&env)?; // rejects FullyPaused; allows Normal & ClaimsOnly
+    _policy_gate(&env, PolicyAction::Claim)?; // rejects FullyPaused; allows Normal & ClaimsOnly
 
     if users.len() > MAX_CLAIM_BATCH_SIZE {
         return Err(ContractError::ClaimBatchTooLarge);
@@ -512,7 +516,7 @@ pub fn resolve_round(env: Env, payload: OraclePayload) -> Result<(), ContractErr
         .ok_or(ContractError::OracleNotSet)?;
 
     oracle.require_auth();
-    _ensure_not_paused(&env).inspect_err(|&e| {
+    _policy_gate(&env, PolicyAction::Settlement).inspect_err(|&e| {
         _emit_action_rejected(&env, &oracle, symbol_short!("resolve"), e);
     })?;
 
@@ -868,7 +872,7 @@ pub fn resolve_round_multi(env: Env, payload: MultiFeedPayload) -> Result<(), Co
         .ok_or(ContractError::OracleNotSet)?;
 
     oracle.require_auth();
-    _ensure_not_paused(&env).inspect_err(|&e| {
+    _policy_gate(&env, PolicyAction::Settlement).inspect_err(|&e| {
         _emit_action_rejected(&env, &oracle, symbol_short!("resolve"), e);
     })?;
 
@@ -1391,7 +1395,7 @@ fn _complete_settlement(
 /// stake recorded for this round.
 pub fn void_round(env: Env, round_id: u64) -> Result<(), ContractError> {
     _require_supported_schema(&env)?;
-    _ensure_not_paused(&env)?;
+    _policy_gate(&env, PolicyAction::Settlement)?;
 
     let pending =
         _read_pending_dispute(&env, round_id).ok_or(ContractError::RoundNotCancellable)?;

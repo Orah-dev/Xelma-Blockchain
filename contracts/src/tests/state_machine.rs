@@ -1,538 +1,485 @@
 // SPDX-License-Identifier: MIT
-//! State-machine tests for explicit round phase transitions with illegal-transition guards.
+//! Legal and illegal round state-machine transitions for both game modes.
 //!
-//! Issue #258 — Every action has a required phase. Operations attempted in the
-//! wrong phase must fail with `ContractError::IllegalPhaseTransition`.
+//! Issues #535 and #551 require the policy and phase matrices to be explicit,
+//! executable, and aligned with the entrypoints in `contract.rs` and
+//! `settlement.rs`. The tables below mirror `ROUND_LIFECYCLE.md` and
+//! `PROTOCOL_SPEC.md`; tests assert the public status and error contracts so a
+//! future guard cannot silently drift from the documented lifecycle.
 //!
-//! ## Allowed Transitions
+//! ## Round transition table
 //!
-//! | Phase        | place_bet | place_precision_prediction | commit_prediction | reveal_prediction | resolve_round | cancel_round |
-//! |--------------|-----------|---------------------------|-------------------|-------------------|---------------|--------------|
-//! | Betting      | ✓         | ✓                         | ✓                 | ✗                 | ✗             | ✓            |
-//! | Running      | ✗         | ✗                         | ✗                 | ✓                 | ✗             | ✓            |
-//! | Resolvable   | ✗         | ✗                         | ✗                 | ✗                 | ✓             | ✓            |
+//! | From                  | Event                     | To              | Modes covered |
+//! |-----------------------|---------------------------|-----------------|---------------|
+//! | `Unknown`             | `create_round`            | `Betting`       | Up/Down, Precision |
+//! | `Betting`             | ledger reaches bet close  | `Running`       | Up/Down, Precision |
+//! | `Running`             | ledger reaches end        | `AwaitingResolve` | Up/Down, Precision |
+//! | `AwaitingResolve`     | successful `resolve_round` | `Resolved`     | Up/Down, Precision |
+//! | `AwaitingResolve`     | minimum not met           | `FallbackRefund` | Up/Down, Precision |
+//! | `Betting`/`Running`/`AwaitingResolve` | `cancel_round` | `Cancelled` | Up/Down, Precision |
+//!
+//! Terminal states are not active. Attempts to mutate or settle them must fail
+//! with the entrypoint's specific error rather than a generic success.
 
 use crate::contract::{VirtualTokenContract, VirtualTokenContractClient};
 use crate::errors::ContractError;
-use crate::types::{BetSide, OraclePayload};
+use crate::types::{
+    BetSide, OraclePayload, Round, RoundArchiveStatus, RoundMode, RoundPhase, RoundStatus,
+};
+use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{
     testutils::{Address as _, Ledger as _},
-    Address, BytesN, Env,
+    Address, Bytes, BytesN, Env,
 };
 
-/// Helper: create a round, mint user, place an Up bet, advance ledger.
-#[allow(dead_code)]
-fn setup_betting_round(env: &Env, client: &VirtualTokenContractClient) -> (Address, Address, Address) {
+const START_LEDGER: u32 = 100;
+const BETTING_LEDGER: u32 = START_LEDGER;
+const RUNNING_LEDGER: u32 = START_LEDGER + 6;
+const AWAITING_RESOLVE_LEDGER: u32 = START_LEDGER + 12;
+const START_TIMESTAMP: u64 = 1_000;
+const START_PRICE: u128 = 10_000;
+
+fn set_ledger(env: &Env, sequence_number: u32) {
+    env.ledger().with_mut(|ledger| {
+        ledger.sequence_number = sequence_number;
+        ledger.timestamp = START_TIMESTAMP;
+    });
+}
+
+fn setup(env: &Env) -> (VirtualTokenContractClient<'_>, Address, Address) {
+    let contract_id = env.register(VirtualTokenContract, ());
+    let client = VirtualTokenContractClient::new(env, &contract_id);
     let admin = Address::generate(env);
     let oracle = Address::generate(env);
+    env.mock_all_auths();
+    client.initialize(&admin, &oracle);
+    client.update_oracle_heartbeat(&0);
+    (client, contract_id, admin)
+}
+
+fn create_round(env: &Env, client: &VirtualTokenContractClient, mode: u32) -> Round {
+    client.create_round(&START_PRICE, &Some(mode));
+    client.get_active_round().expect("create_round should store an active round")
+}
+
+fn oracle_payload(
+    env: &Env,
+    client: &VirtualTokenContractClient,
+    round: &Round,
+    price: u128,
+) -> OraclePayload {
+    OraclePayload {
+        price,
+        timestamp: env.ledger().timestamp(),
+        round_id: round.start_ledger,
+        nonce: round.round_id + 1,
+        network_id: env.ledger().network_id(),
+        contract_addr: client.address.clone(),
+        confidence: None,
+        attestation: None,
+    }
+}
+
+fn valid_commitment(
+    env: &Env,
+    predicted_price: u128,
+) -> (BytesN<32>, BytesN<32>) {
+    let salt = BytesN::from_array(
+        env,
+        &[
+            0x42, 0x43, 0x43, 0x43, 0x43, 0x43, 0x43, 0x43, 0x43, 0x43, 0x43, 0x43, 0x43,
+            0x43, 0x43, 0x43, 0x43, 0x43, 0x43, 0x43, 0x43, 0x43, 0x43, 0x43, 0x43, 0x43,
+            0x43, 0x43, 0x43, 0x43, 0x43, 0x44,
+        ],
+    );
+    let mut preimage = Bytes::new(env);
+    preimage.append(&predicted_price.to_xdr(env));
+    preimage.append(&salt.to_xdr(env));
+    let hash: BytesN<32> = env.crypto().sha256(&preimage).into();
+    (hash, salt)
+}
+
+fn participate(env: &Env, client: &VirtualTokenContractClient, mode: u32) -> Address {
     let user = Address::generate(env);
-
-    env.mock_all_auths();
-    client.initialize(&admin, &oracle);
     client.mint_initial(&user);
-    client.create_round(&10_0000u128, &None);
-    client.place_bet(&user, &100_0000000, &BetSide::Up);
-
-    (admin, oracle, user)
+    match mode {
+        0 => client.place_bet(&user, &100_000000, &BetSide::Up),
+        1 => client.place_precision_prediction(&user, &100_000000, &12_500),
+        _ => unreachable!("test helper accepts only Up/Down and Precision"),
+    }
+    user
 }
 
-// ─── Betting phase: allowed actions ─────────────────────────────────────────
+fn assert_derived_phase_transitions(env: &Env, mode: u32) {
+    set_ledger(env, BETTING_LEDGER);
+    let (client, _contract_id, _admin) = setup(env);
+    let round = create_round(env, &client, mode);
 
-/// place_bet succeeds in Betting phase.
-#[test]
-fn test_place_bet_succeeds_in_betting_phase() {
-    let env = Env::default();
-    let (client, _admin, _oracle) = {
-        let a = Address::generate(&env);
-        let o = Address::generate(&env);
-        env.mock_all_auths();
-        let contract_id = env.register(VirtualTokenContract, ());
-        let c = VirtualTokenContractClient::new(&env, &contract_id);
-        c.initialize(&a, &o);
-        (c, a, o)
-    };
-    let user = Address::generate(&env);
-    client.mint_initial(&user);
-
-    env.ledger().with_mut(|li| li.sequence_number = 100);
-    client.create_round(&10_0000u128, &None);
-
-    // Should succeed — ledger 100 is within Betting window (bet_end_ledger = 106)
-    let result = client.try_place_bet(&user, &100_0000000, &BetSide::Up);
-    assert!(result.is_ok(), "place_bet should succeed in Betting phase");
-}
-
-/// place_precision_prediction succeeds in Betting phase.
-#[test]
-fn test_place_precision_prediction_succeeds_in_betting_phase() {
-    let env = Env::default();
-    let (client, _admin, _oracle) = {
-        let a = Address::generate(&env);
-        let o = Address::generate(&env);
-        env.mock_all_auths();
-        let contract_id = env.register(VirtualTokenContract, ());
-        let c = VirtualTokenContractClient::new(&env, &contract_id);
-        c.initialize(&a, &o);
-        (c, a, o)
-    };
-    let user = Address::generate(&env);
-    client.mint_initial(&user);
-
-    env.ledger().with_mut(|li| li.sequence_number = 100);
-    // Precision mode (mode=1)
-    client.create_round(&10_0000u128, &Some(1));
-
-    let result = client.try_place_precision_prediction(&user, &100_0000000, &12_5000);
-    assert!(
-        result.is_ok(),
-        "place_precision_prediction should succeed in Betting phase"
-    );
-}
-
-/// commit_prediction succeeds in Betting phase.
-#[test]
-fn test_commit_prediction_succeeds_in_betting_phase() {
-    let env = Env::default();
-    let (client, _admin, _oracle) = {
-        let a = Address::generate(&env);
-        let o = Address::generate(&env);
-        env.mock_all_auths();
-        let contract_id = env.register(VirtualTokenContract, ());
-        let c = VirtualTokenContractClient::new(&env, &contract_id);
-        c.initialize(&a, &o);
-        (c, a, o)
-    };
-    let user = Address::generate(&env);
-    client.mint_initial(&user);
-
-    env.ledger().with_mut(|li| li.sequence_number = 100);
-    client.create_round(&10_0000u128, &Some(1));
-
-    let hash = BytesN::from_array(&env, &[1u8; 32]);
-    let result = client.try_commit_prediction(&user, &hash, &100_0000000);
-    assert!(
-        result.is_ok(),
-        "commit_prediction should succeed in Betting phase"
-    );
-}
-
-// ─── Betting phase: illegal transitions ────────────────────────────────────
-
-/// reveal_prediction fails in Betting phase.
-///
-/// Uses a valid salt (two distinct non-zero bytes) so the entropy gate passes
-/// and the test reaches the actual phase guard.
-#[test]
-fn test_reveal_prediction_fails_in_betting_phase() {
-    use soroban_sdk::xdr::ToXdr;
-
-    let env = Env::default();
-    let (client, _admin, _oracle) = {
-        let a = Address::generate(&env);
-        let o = Address::generate(&env);
-        env.mock_all_auths();
-        let contract_id = env.register(VirtualTokenContract, ());
-        let c = VirtualTokenContractClient::new(&env, &contract_id);
-        c.initialize(&a, &o);
-        (c, a, o)
-    };
-    let user = Address::generate(&env);
-    client.mint_initial(&user);
-
-    let predicted_price = 12_5000u128;
-    // Valid salt: first byte differs from the rest so entropy check passes
-    let salt = BytesN::from_array(&env, &[1u8, 2u8, 2u8, 2u8, 2u8, 2u8, 2u8, 2u8, 2u8, 2u8, 2u8, 2u8, 2u8, 2u8, 2u8, 2u8, 2u8, 2u8, 2u8, 2u8, 2u8, 2u8, 2u8, 2u8, 2u8, 2u8, 2u8, 2u8, 2u8, 2u8, 2u8, 2u8]);
-
-    // Compute the commitment hash
-    let mut preimage = soroban_sdk::Bytes::new(&env);
-    preimage.append(&predicted_price.to_xdr(&env));
-    preimage.append(&salt.clone().to_xdr(&env));
-    let hash: BytesN<32> = env.crypto().sha256(&preimage).into();
-
-    env.ledger().with_mut(|li| li.sequence_number = 100);
-    client.create_round(&10_0000u128, &Some(1));
-
-    // Commit in Betting phase with the computed hash
-    client.commit_prediction(&user, &hash, &100_0000000);
-
-    // Try to reveal while still in Betting phase (ledger 100 < bet_end_ledger = 106)
-    let result = client.try_reveal_prediction(&user, &predicted_price, &salt);
+    assert_eq!(client.get_round_phase(), Ok(RoundPhase::Betting));
     assert_eq!(
-        result,
-        Err(Ok(ContractError::IllegalPhaseTransition)),
-        "reveal_prediction in Betting phase must return IllegalPhaseTransition"
+        client.get_round_status(round.round_id),
+        RoundStatus::Betting
     );
-}
 
-/// resolve_round fails in Betting phase.
-#[test]
-fn test_resolve_round_fails_in_betting_phase() {
-    let env = Env::default();
-    let (client, _admin, _oracle) = {
-        let a = Address::generate(&env);
-        let o = Address::generate(&env);
-        env.mock_all_auths();
-        let contract_id = env.register(VirtualTokenContract, ());
-        let c = VirtualTokenContractClient::new(&env, &contract_id);
-        c.initialize(&a, &o);
-        (c, a, o)
-    };
-
-    env.ledger().with_mut(|li| li.sequence_number = 100);
-    client.create_round(&10_0000u128, &None);
-
-    let payload = OraclePayload {
-        price: 11_0000,
-        timestamp: env.ledger().timestamp(),
-        round_id: 100,
-        nonce: 1,
-        network_id: env.ledger().network_id(),
-        contract_addr: client.address.clone(),
-        confidence: None,
-    };
-
-    let result = client.try_resolve_round(&payload);
+    set_ledger(env, RUNNING_LEDGER);
+    assert_eq!(client.get_round_phase(), Ok(RoundPhase::Running));
     assert_eq!(
-        result,
-        Err(Ok(ContractError::IllegalPhaseTransition)),
-        "resolve_round in Betting phase must return IllegalPhaseTransition"
+        client.get_round_status(round.round_id),
+        RoundStatus::Running
+    );
+
+    set_ledger(env, AWAITING_RESOLVE_LEDGER);
+    assert_eq!(client.get_round_phase(), Ok(RoundPhase::Resolvable));
+    assert_eq!(
+        client.get_round_status(round.round_id),
+        RoundStatus::AwaitingResolve
     );
 }
 
-// ─── Running phase: allowed actions ────────────────────────────────────────
-
-/// reveal_prediction succeeds in Running phase.
-///
-/// Proper commit-reveal flow: commit a SHA-256 hash of (predicted_price || salt)
-/// in Betting phase, then reveal it in Running phase with the preimage.
-/// Uses a valid salt (two distinct non-zero bytes) so the entropy gate passes.
 #[test]
-fn test_reveal_prediction_succeeds_in_running_phase() {
-    use soroban_sdk::xdr::ToXdr;
-
+fn test_updown_derived_phase_transitions() {
     let env = Env::default();
-    let (client, _admin, _oracle) = {
-        let a = Address::generate(&env);
-        let o = Address::generate(&env);
-        let c = {
-            env.mock_all_auths();
-            let contract_id = env.register(VirtualTokenContract, ());
-            VirtualTokenContractClient::new(&env, &contract_id)
-        };
-        c.initialize(&a, &o);
-        (c, a, o)
-    };
+    assert_derived_phase_transitions(&env, 0);
+}
+
+#[test]
+fn test_precision_derived_phase_transitions() {
+    let env = Env::default();
+    assert_derived_phase_transitions(&env, 1);
+}
+
+fn assert_cancellation(env: &Env, mode: u32, phase_ledger: u32) {
+    set_ledger(env, phase_ledger);
+    let (client, _contract_id, _admin) = setup(env);
+    let round = create_round(env, &client, mode);
+    let user = participate(env, &client, mode);
+
+    client.cancel_round(&0);
+    assert!(client.get_active_round().is_none());
+    assert_eq!(
+        client.get_round_status(round.round_id),
+        RoundStatus::Cancelled
+    );
+    let archive = client
+        .get_archived_round(round.round_id)
+        .expect("cancelled round should be archived");
+    assert_eq!(archive.status, RoundArchiveStatus::Cancelled);
+    assert_eq!(
+        archive.mode,
+        if mode == 0 {
+            RoundMode::UpDown
+        } else {
+            RoundMode::Precision
+        }
+    );
+
+    // A terminal round cannot be settled or cancelled again.
+    assert_eq!(
+        client.try_resolve_round(&oracle_payload(env, &client, &round, 11_000)),
+        Err(Ok(ContractError::NoActiveRound))
+    );
+    assert_eq!(
+        client.try_cancel_round(&0),
+        Err(Ok(ContractError::RoundNotCancellable))
+    );
+
+    // A replacement cannot reuse the same start ledger, but is legal once the
+    // ledger advances.
+    assert_eq!(
+        client.try_create_round(&START_PRICE, &Some(mode)),
+        Err(Ok(ContractError::RoundStartLedgerReused))
+    );
+    set_ledger(env, phase_ledger + 1);
+    let replacement = create_round(env, &client, mode);
+    assert_eq!(
+        client.get_round_status(replacement.round_id),
+        RoundStatus::Betting
+    );
+    assert_eq!(client.balance(&user), 900_000000);
+}
+
+#[test]
+fn test_updown_can_cancel_from_every_active_phase() {
+    for phase_ledger in [BETTING_LEDGER, RUNNING_LEDGER, AWAITING_RESOLVE_LEDGER] {
+        let env = Env::default();
+        assert_cancellation(&env, 0, phase_ledger);
+    }
+}
+
+#[test]
+fn test_precision_can_cancel_from_every_active_phase() {
+    for phase_ledger in [BETTING_LEDGER, RUNNING_LEDGER, AWAITING_RESOLVE_LEDGER] {
+        let env = Env::default();
+        assert_cancellation(&env, 1, phase_ledger);
+    }
+}
+
+fn assert_resolution(env: &Env, mode: u32) {
+    set_ledger(env, BETTING_LEDGER);
+    let (client, _contract_id, _admin) = setup(env);
+    let round = create_round(env, &client, mode);
+    let _user = participate(env, &client, mode);
+    set_ledger(env, AWAITING_RESOLVE_LEDGER);
+
+    let payload = oracle_payload(env, &client, &round, 11_000);
+    client.resolve_round(&payload);
+
+    assert!(client.get_active_round().is_none());
+    assert_eq!(
+        client.get_round_status(round.round_id),
+        RoundStatus::Resolved
+    );
+    let archive = client
+        .get_archived_round(round.round_id)
+        .expect("resolved round should be archived");
+    assert_eq!(archive.status, RoundArchiveStatus::Resolved);
+    assert_eq!(
+        archive.mode,
+        if mode == 0 {
+            RoundMode::UpDown
+        } else {
+            RoundMode::Precision
+        }
+    );
+
+    assert_eq!(
+        client.try_cancel_round(&0),
+        Err(Ok(ContractError::RoundNotCancellable))
+    );
+    assert_eq!(
+        client.try_resolve_round(&payload),
+        Err(Ok(ContractError::NoActiveRound))
+    );
+}
+
+#[test]
+fn test_updown_resolves_from_awaiting_resolve() {
+    let env = Env::default();
+    assert_resolution(&env, 0);
+}
+
+#[test]
+fn test_precision_resolves_from_awaiting_resolve() {
+    let env = Env::default();
+    assert_resolution(&env, 1);
+}
+
+fn assert_fallback_resolution(env: &Env, mode: u32) {
+    set_ledger(env, BETTING_LEDGER);
+    let (client, _contract_id, _admin) = setup(env);
+    client.set_min_participants(&Some(2));
+    let round = create_round(env, &client, mode);
+    let _user = participate(env, &client, mode);
+    set_ledger(env, AWAITING_RESOLVE_LEDGER);
+
+    client.resolve_round(&oracle_payload(env, &client, &round, 11_000));
+
+    assert_eq!(
+        client.get_round_status(round.round_id),
+        RoundStatus::FallbackRefund
+    );
+    let archive = client
+        .get_archived_round(round.round_id)
+        .expect("fallback round should be archived");
+    assert_eq!(archive.status, RoundArchiveStatus::FallbackRefund);
+    assert_eq!(
+        archive.mode,
+        if mode == 0 {
+            RoundMode::UpDown
+        } else {
+            RoundMode::Precision
+        }
+    );
+}
+
+#[test]
+fn test_updown_can_take_fallback_refund_transition() {
+    let env = Env::default();
+    assert_fallback_resolution(&env, 0);
+}
+
+#[test]
+fn test_precision_can_take_fallback_refund_transition() {
+    let env = Env::default();
+    assert_fallback_resolution(&env, 1);
+}
+
+fn assert_premature_resolution(env: &Env, mode: u32) {
+    set_ledger(env, BETTING_LEDGER);
+    let (client, _contract_id, _admin) = setup(env);
+    let round = create_round(env, &client, mode);
+    let payload = oracle_payload(env, &client, &round, 11_000);
+
+    assert_eq!(
+        client.try_resolve_round(&payload),
+        Err(Ok(ContractError::RoundNotEnded))
+    );
+    assert_eq!(
+        client.get_round_status(round.round_id),
+        RoundStatus::Betting
+    );
+
+    set_ledger(env, RUNNING_LEDGER);
+    assert_eq!(
+        client.try_resolve_round(&payload),
+        Err(Ok(ContractError::RoundNotEnded))
+    );
+    assert_eq!(
+        client.get_round_status(round.round_id),
+        RoundStatus::Running
+    );
+}
+
+#[test]
+fn test_updown_rejects_premature_resolution_in_betting_and_running() {
+    let env = Env::default();
+    assert_premature_resolution(&env, 0);
+}
+
+#[test]
+fn test_precision_rejects_premature_resolution_in_betting_and_running() {
+    let env = Env::default();
+    assert_premature_resolution(&env, 1);
+}
+
+#[test]
+fn test_updown_rejects_participation_after_betting_closes() {
+    let env = Env::default();
+    set_ledger(&env, BETTING_LEDGER);
+    let (client, _contract_id, _admin) = setup(&env);
+    create_round(&env, &client, 0);
     let user = Address::generate(&env);
     client.mint_initial(&user);
+    set_ledger(&env, RUNNING_LEDGER);
 
-    let predicted_price = 12_5000u128;
-    // Valid salt: first byte differs from the rest so salt_has_minimum_entropy passes
-    let salt = BytesN::from_array(&env, &[0x42u8, 0x43u8, 0x43u8, 0x43u8, 0x43u8, 0x43u8, 0x43u8, 0x43u8, 0x43u8, 0x43u8, 0x43u8, 0x43u8, 0x43u8, 0x43u8, 0x43u8, 0x43u8, 0x43u8, 0x43u8, 0x43u8, 0x43u8, 0x43u8, 0x43u8, 0x43u8, 0x43u8, 0x43u8, 0x43u8, 0x43u8, 0x43u8, 0x43u8, 0x43u8, 0x43u8, 0x43u8]);
-
-    // Compute the commitment hash: sha256(predicted_price.to_xdr() || salt.to_xdr())
-    let mut preimage = soroban_sdk::Bytes::new(&env);
-    preimage.append(&predicted_price.to_xdr(&env));
-    preimage.append(&salt.clone().to_xdr(&env));
-    let hash: BytesN<32> = env.crypto().sha256(&preimage).into();
-
-    env.ledger().with_mut(|li| li.sequence_number = 100);
-    client.create_round(&10_0000u128, &Some(1));
-
-    // Commit in Betting phase
-    client.commit_prediction(&user, &hash, &100_0000000);
-
-    // Advance to Running phase (bet_end_ledger = 106, end_ledger = 112)
-    env.ledger().with_mut(|li| li.sequence_number = 110);
-
-    // Reveal with correct preimage — should succeed
-    let result = client.try_reveal_prediction(&user, &predicted_price, &salt);
-    assert!(
-        result.is_ok(),
-        "reveal_prediction should succeed in Running phase with correct preimage"
-    );
-}
-
-// ─── Running phase: illegal transitions ────────────────────────────────────
-
-/// place_bet fails in Running phase.
-#[test]
-fn test_place_bet_fails_in_running_phase() {
-    let env = Env::default();
-    let (client, _admin, _oracle) = {
-        // One user bets in Betting, another tries in Running
-        let contract_id = env.register(VirtualTokenContract, ());
-        let c = VirtualTokenContractClient::new(&env, &contract_id);
-        let admin = Address::generate(&env);
-        let oracle = Address::generate(&env);
-        env.mock_all_auths();
-        c.initialize(&admin, &oracle);
-        (c, admin, oracle)
-    };
-    let user1 = Address::generate(&env);
-    let user2 = Address::generate(&env);
-    client.mint_initial(&user1);
-    client.mint_initial(&user2);
-
-    env.ledger().with_mut(|li| li.sequence_number = 100);
-    client.create_round(&10_0000u128, &None);
-    client.place_bet(&user1, &100_0000000, &BetSide::Up);
-
-    // Advance to Running phase (ledger 106 = bet_end_ledger)
-    env.ledger().with_mut(|li| li.sequence_number = 108);
-
-    let result = client.try_place_bet(&user2, &100_0000000, &BetSide::Down);
     assert_eq!(
-        result,
-        Err(Ok(ContractError::IllegalPhaseTransition)),
-        "place_bet in Running phase must return IllegalPhaseTransition"
+        client.try_place_bet(&user, &100_000000, &BetSide::Down),
+        Err(Ok(ContractError::RoundEnded))
     );
+    assert_eq!(client.balance(&user), 1000_000000);
 }
 
-/// place_precision_prediction fails in Running phase.
 #[test]
-fn test_place_precision_prediction_fails_in_running_phase() {
+fn test_precision_rejects_participation_after_betting_closes() {
     let env = Env::default();
-    let (client, _admin, _oracle) = {
-        let contract_id = env.register(VirtualTokenContract, ());
-        let c = VirtualTokenContractClient::new(&env, &contract_id);
-        let admin = Address::generate(&env);
-        let oracle = Address::generate(&env);
-        env.mock_all_auths();
-        c.initialize(&admin, &oracle);
-        (c, admin, oracle)
-    };
+    set_ledger(&env, BETTING_LEDGER);
+    let (client, _contract_id, _admin) = setup(&env);
+    create_round(&env, &client, 1);
     let user = Address::generate(&env);
     client.mint_initial(&user);
+    set_ledger(&env, RUNNING_LEDGER);
 
-    env.ledger().with_mut(|li| li.sequence_number = 100);
-    client.create_round(&10_0000u128, &Some(1));
-
-    // Advance to Running phase
-    env.ledger().with_mut(|li| li.sequence_number = 108);
-
-    let result = client.try_place_precision_prediction(&user, &100_0000000, &12_5000);
     assert_eq!(
-        result,
-        Err(Ok(ContractError::IllegalPhaseTransition)),
-        "place_precision_prediction in Running phase must return IllegalPhaseTransition"
+        client.try_place_precision_prediction(&user, &100_000000, &12_500),
+        Err(Ok(ContractError::RoundEnded))
     );
+    assert_eq!(
+        client.try_commit_prediction(
+            &user,
+            &BytesN::from_array(&env, &[1; 32]),
+            &100_000000
+        ),
+        Err(Ok(ContractError::RoundEnded))
+    );
+    assert_eq!(client.balance(&user), 1000_000000);
 }
 
-/// commit_prediction fails in Running phase.
+fn assert_reveal_window(env: &Env, reveal_ledger: u32) {
+    set_ledger(env, BETTING_LEDGER);
+    let (client, _contract_id, _admin) = setup(env);
+    create_round(env, &client, 1);
+    let user = Address::generate(env);
+    client.mint_initial(&user);
+    let (hash, salt) = valid_commitment(env, 12_500);
+    client.commit_prediction(&user, &hash, &100_000000);
+    set_ledger(env, reveal_ledger);
+
+    assert_eq!(
+        client.try_reveal_prediction(&user, &12_500, &salt),
+        Err(Ok(ContractError::InvalidRevealWindow))
+    );
+    assert_eq!(client.balance(&user), 900_000000);
+}
+
 #[test]
-fn test_commit_prediction_fails_in_running_phase() {
+fn test_precision_rejects_reveal_in_betting_and_awaiting_resolve() {
     let env = Env::default();
-    let (client, _admin, _oracle) = {
-        let contract_id = env.register(VirtualTokenContract, ());
-        let c = VirtualTokenContractClient::new(&env, &contract_id);
-        let admin = Address::generate(&env);
-        let oracle = Address::generate(&env);
-        env.mock_all_auths();
-        c.initialize(&admin, &oracle);
-        (c, admin, oracle)
-    };
+    assert_reveal_window(&env, BETTING_LEDGER);
+    let env = Env::default();
+    assert_reveal_window(&env, AWAITING_RESOLVE_LEDGER);
+}
+
+#[test]
+fn test_precision_allows_reveal_in_running_phase() {
+    let env = Env::default();
+    set_ledger(&env, BETTING_LEDGER);
+    let (client, _contract_id, _admin) = setup(&env);
+    create_round(&env, &client, 1);
     let user = Address::generate(&env);
     client.mint_initial(&user);
+    let (hash, salt) = valid_commitment(&env, 12_500);
+    client.commit_prediction(&user, &hash, &100_000000);
+    set_ledger(&env, RUNNING_LEDGER);
 
-    env.ledger().with_mut(|li| li.sequence_number = 100);
-    client.create_round(&10_0000u128, &Some(1));
-
-    // Advance to Running phase
-    env.ledger().with_mut(|li| li.sequence_number = 108);
-
-    let hash = BytesN::from_array(&env, &[1u8; 32]);
-    let result = client.try_commit_prediction(&user, &hash, &100_0000000);
-    assert_eq!(
-        result,
-        Err(Ok(ContractError::IllegalPhaseTransition)),
-        "commit_prediction in Running phase must return IllegalPhaseTransition"
-    );
+    client.reveal_prediction(&user, &12_500, &salt);
+    let prediction = client
+        .get_user_precision_prediction(&user)
+        .expect("reveal should create the precision position");
+    assert_eq!(prediction.predicted_price, 12_500);
+    assert_eq!(prediction.amount, 100_000000);
 }
 
-/// resolve_round fails in Running phase.
 #[test]
-fn test_resolve_round_fails_in_running_phase() {
+fn test_mode_isolation_rejects_cross_mode_entrypoints() {
     let env = Env::default();
-    let (client, _admin, _oracle) = {
-        let contract_id = env.register(VirtualTokenContract, ());
-        let c = VirtualTokenContractClient::new(&env, &contract_id);
-        let admin = Address::generate(&env);
-        let oracle_addr = Address::generate(&env);
-        env.mock_all_auths();
-        c.initialize(&admin, &oracle_addr);
-        (c, admin, oracle_addr)
-    };
-
-    env.ledger().with_mut(|li| li.sequence_number = 100);
-    client.create_round(&10_0000u128, &None);
-
-    // Advance to Running phase (bet_end_ledger = 106, end_ledger = 112)
-    env.ledger().with_mut(|li| li.sequence_number = 108);
-
-    let payload = OraclePayload {
-        price: 11_0000,
-        timestamp: env.ledger().timestamp(),
-        round_id: 100,
-        nonce: 1,
-        network_id: env.ledger().network_id(),
-        contract_addr: client.address.clone(),
-        confidence: None,
-    };
-
-    let result = client.try_resolve_round(&payload);
-    assert_eq!(
-        result,
-        Err(Ok(ContractError::IllegalPhaseTransition)),
-        "resolve_round in Running phase must return IllegalPhaseTransition"
-    );
-}
-
-// ─── Resolvable phase: allowed actions ─────────────────────────────────────
-
-/// resolve_round succeeds in Resolvable phase.
-#[test]
-fn test_resolve_round_succeeds_in_resolvable_phase() {
-    let env = Env::default();
-    let (client, _admin, _oracle) = {
-        let contract_id = env.register(VirtualTokenContract, ());
-        let c = VirtualTokenContractClient::new(&env, &contract_id);
-        let admin = Address::generate(&env);
-        let oracle_addr = Address::generate(&env);
-        env.mock_all_auths();
-        c.initialize(&admin, &oracle_addr);
-        (c, admin, oracle_addr)
-    };
+    set_ledger(&env, BETTING_LEDGER);
+    let (client, _contract_id, _admin) = setup(&env);
+    create_round(&env, &client, 0);
     let user = Address::generate(&env);
     client.mint_initial(&user);
+    let (hash, salt) = valid_commitment(&env, 12_500);
 
-    env.ledger().with_mut(|li| li.sequence_number = 100);
-    client.create_round(&10_0000u128, &None);
-    client.place_bet(&user, &100_0000000, &BetSide::Up);
-
-    // Advance to Resolvable phase (end_ledger = 112)
-    env.ledger().with_mut(|li| {
-        li.sequence_number = 120;
-        li.timestamp = 1_000_000;
-    });
-
-    let payload = OraclePayload {
-        price: 11_0000,
-        timestamp: env.ledger().timestamp(),
-        round_id: 100,
-        nonce: 1,
-        network_id: env.ledger().network_id(),
-        contract_addr: client.address.clone(),
-        confidence: None,
-    };
-
-    let result = client.try_resolve_round(&payload);
-    assert!(
-        result.is_ok(),
-        "resolve_round should succeed in Resolvable phase"
+    assert_eq!(
+        client.try_place_precision_prediction(&user, &100_000000, &12_500),
+        Err(Ok(ContractError::WrongModeForPrediction))
     );
-}
+    assert_eq!(
+        client.try_commit_prediction(&user, &hash, &100_000000),
+        Err(Ok(ContractError::WrongModeForPrediction))
+    );
+    assert_eq!(
+        client.try_reveal_prediction(&user, &12_500, &salt),
+        Err(Ok(ContractError::WrongModeForPrediction))
+    );
 
-// ─── Resolvable phase: illegal transitions ─────────────────────────────────
-
-/// place_bet fails in Resolvable phase.
-#[test]
-fn test_place_bet_fails_in_resolvable_phase() {
     let env = Env::default();
-    let contract_id = env.register(VirtualTokenContract, ());
-    let client = VirtualTokenContractClient::new(&env, &contract_id);
-    let admin = Address::generate(&env);
-    let oracle = Address::generate(&env);
-    env.mock_all_auths();
-    client.initialize(&admin, &oracle);
+    set_ledger(&env, BETTING_LEDGER);
+    let (client, _contract_id, _admin) = setup(&env);
+    create_round(&env, &client, 1);
     let user = Address::generate(&env);
     client.mint_initial(&user);
-
-    env.ledger().with_mut(|li| li.sequence_number = 100);
-    client.create_round(&10_0000u128, &None);
-
-    // Advance to Resolvable phase (end_ledger = start=100 + run=12 = 112)
-    env.ledger().with_mut(|li| li.sequence_number = 120);
-
-    let result = client.try_place_bet(&user, &100_0000000, &BetSide::Up);
     assert_eq!(
-        result,
-        Err(Ok(ContractError::IllegalPhaseTransition)),
-        "place_bet in Resolvable phase must return IllegalPhaseTransition"
+        client.try_place_bet(&user, &100_000000, &BetSide::Up),
+        Err(Ok(ContractError::WrongModeForPrediction))
     );
+    assert_eq!(client.balance(&user), 1000_000000);
 }
 
-/// cancel_round always succeeds regardless of phase.
 #[test]
-fn test_cancel_round_succeeds_in_any_phase() {
-    let env = Env::default();
-    let contract_id = env.register(VirtualTokenContract, ());
-    let client = VirtualTokenContractClient::new(&env, &contract_id);
-    let admin = Address::generate(&env);
-    let oracle = Address::generate(&env);
-    env.mock_all_auths();
-    client.initialize(&admin, &oracle);
+fn test_creating_a_second_active_round_is_rejected_in_both_modes() {
+    for mode in [0, 1] {
+        let env = Env::default();
+        set_ledger(&env, BETTING_LEDGER);
+        let (client, _contract_id, _admin) = setup(&env);
+        let first = create_round(&env, &client, mode);
 
-    // Cancel in Betting
-    client.create_round(&10_0000u128, &None);
-    let result = client.try_cancel_round(&0);
-    assert!(result.is_ok(), "cancel_round should succeed in Betting phase");
-
-    // Create another and cancel in Running
-    env.ledger().with_mut(|li| li.sequence_number = 200);
-    client.create_round(&10_0000u128, &None);
-    env.ledger().with_mut(|li| li.sequence_number = 208);
-    let result = client.try_cancel_round(&0);
-    assert!(result.is_ok(), "cancel_round should succeed in Running phase");
-
-    // Create another and cancel in Resolvable
-    env.ledger().with_mut(|li| li.sequence_number = 300);
-    client.create_round(&10_0000u128, &None);
-    env.ledger().with_mut(|li| li.sequence_number = 320);
-    let result = client.try_cancel_round(&0);
-    assert!(
-        result.is_ok(),
-        "cancel_round should succeed in Resolvable phase"
-    );
-}
-
-/// reveal_prediction fails in Resolvable phase.
-///
-/// Uses a valid salt (two distinct non-zero bytes) so the entropy gate passes
-/// and the test reaches the actual phase guard.
-#[test]
-fn test_reveal_prediction_fails_in_resolvable_phase() {
-    use soroban_sdk::xdr::ToXdr;
-
-    let env = Env::default();
-    let contract_id = env.register(VirtualTokenContract, ());
-    let client = VirtualTokenContractClient::new(&env, &contract_id);
-    let admin = Address::generate(&env);
-    let oracle = Address::generate(&env);
-    env.mock_all_auths();
-    client.initialize(&admin, &oracle);
-    let user = Address::generate(&env);
-    client.mint_initial(&user);
-
-    let predicted_price = 12_5000u128;
-    let salt = BytesN::from_array(&env, &[0x42u8, 0x43u8, 0x43u8, 0x43u8, 0x43u8, 0x43u8, 0x43u8, 0x43u8, 0x43u8, 0x43u8, 0x43u8, 0x43u8, 0x43u8, 0x43u8, 0x43u8, 0x43u8, 0x43u8, 0x43u8, 0x43u8, 0x43u8, 0x43u8, 0x43u8, 0x43u8, 0x43u8, 0x43u8, 0x43u8, 0x43u8, 0x43u8, 0x43u8, 0x43u8, 0x43u8, 0x43u8]);
-
-    // Compute and commit the proper hash
-    let mut preimage = soroban_sdk::Bytes::new(&env);
-    preimage.append(&predicted_price.to_xdr(&env));
-    preimage.append(&salt.clone().to_xdr(&env));
-    let hash: BytesN<32> = env.crypto().sha256(&preimage).into();
-
-    env.ledger().with_mut(|li| li.sequence_number = 100);
-    client.create_round(&10_0000u128, &Some(1));
-    client.commit_prediction(&user, &hash, &100_0000000);
-
-    // Advance to Resolvable phase (end_ledger = 112)
-    env.ledger().with_mut(|li| li.sequence_number = 120);
-
-    let result = client.try_reveal_prediction(&user, &predicted_price, &salt);
-    assert_eq!(
-        result,
-        Err(Ok(ContractError::IllegalPhaseTransition)),
-        "reveal_prediction in Resolvable phase must return IllegalPhaseTransition"
-    );
+        assert_eq!(
+            client.try_create_round(&START_PRICE, &Some(1 - mode)),
+            Err(Ok(ContractError::RoundAlreadyActive))
+        );
+        assert_eq!(
+            client.get_round_status(first.round_id),
+            RoundStatus::Betting
+        );
+    }
 }

@@ -2,8 +2,11 @@
 //! Exhaustive mode x action tests for the central PolicyGate (Issue #261).
 
 use crate::contract::{VirtualTokenContract, VirtualTokenContractClient};
-use crate::types::PolicyAction;
-use soroban_sdk::{testutils::Address as _, Address, Env};
+use crate::types::{DataKeyScoped, PolicyAction};
+use soroban_sdk::{
+    testutils::{storage::Persistent as _, Address as _},
+    Address, Env, Vec,
+};
 
 fn setup(env: &Env) -> (VirtualTokenContractClient<'_>, Address, Address) {
     let contract_id = env.register(VirtualTokenContract, ());
@@ -14,6 +17,14 @@ fn setup(env: &Env) -> (VirtualTokenContractClient<'_>, Address, Address) {
     env.mock_all_auths();
     client.initialize(&admin, &oracle);
     (client, admin, oracle)
+}
+
+fn set_pending(env: &Env, client: &VirtualTokenContractClient, user: &Address, amount: i128) {
+    env.as_contract(&client.address, || {
+        env.storage()
+            .persistent()
+            .set(&DataKeyScoped::PendingWinnings(user.clone()), &amount);
+    });
 }
 
 #[test]
@@ -85,6 +96,47 @@ fn test_policy_gate_admin_config_still_allowed_in_claims_only() {
     // Admin can still reconfigure — e.g. pause_contract itself is AdminConfig-gated.
     client.pause_contract();
     assert!(client.is_paused());
+}
+
+#[test]
+fn test_policy_gate_claim_action_matches_real_claim_entrypoint() {
+    let env = Env::default();
+    let (client, _admin, _oracle) = setup(&env);
+    let user = Address::generate(&env);
+
+    set_pending(&env, &client, &user, 100);
+    assert!(client.is_action_allowed(&PolicyAction::Claim));
+    assert_eq!(client.claim_winnings(&user), 100);
+    assert_eq!(client.balance(&user), 100);
+
+    set_pending(&env, &client, &user, 200);
+    client.set_runtime_mode(&1); // ClaimsOnly
+    assert!(client.is_action_allowed(&PolicyAction::Claim));
+    assert_eq!(client.claim_winnings(&user), 200);
+    assert_eq!(client.balance(&user), 300);
+
+    set_pending(&env, &client, &user, 400);
+    let mut users = Vec::new(&env);
+    users.push_back(user.clone());
+    let claimed = client.claim_many(&users);
+    assert_eq!(claimed.get(0), Some(400));
+    let repeated = client.claim_many(&users);
+    assert_eq!(repeated.get(0), Some(0));
+    assert_eq!(client.balance(&user), 700);
+
+    set_pending(&env, &client, &user, 500);
+    client.pause_contract(); // FullyPaused
+    assert!(!client.is_action_allowed(&PolicyAction::Claim));
+    assert_eq!(
+        client.try_claim_winnings(&user),
+        Err(Ok(crate::errors::ContractError::ContractPaused))
+    );
+    assert_eq!(
+        client.try_claim_many(&users),
+        Err(Ok(crate::errors::ContractError::ContractPaused))
+    );
+    assert_eq!(client.balance(&user), 700);
+    assert_eq!(client.get_pending_winnings(&user), 500);
 }
 
 #[test]
